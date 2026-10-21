@@ -9,6 +9,8 @@ try:
 except ImportError:
     sys.exit("Warning: 'numpy' module not found.")
 
+CLOCKWISE = 1
+COUNTER_CLOCKWISE = -1
 
 def clamp(value, value_min, value_max):
     return min(max(value, value_min), value_max)
@@ -61,6 +63,11 @@ class Mavic (Robot):
         self.target_position = [0, 0, 0]
         self.target_index = 0
         self.target_altitude = 0
+
+        self.avoidance_state = "NORMAL"
+        self.avoidance_direction = CLOCKWISE
+        self.avoidance_yaw = 0.0
+        self.bypass_start_position = None
 
     def set_position(self, pos):
         """
@@ -121,6 +128,25 @@ class Mavic (Robot):
                 angle_left, distance_left))
         return yaw_disturbance, pitch_disturbance
 
+    def minimum_valid_range(self, values, minimum, maximum):
+        valid = [
+            value for value in values
+            if math.isfinite(value)
+            and minimum <= value <= maximum
+        ]
+
+        return min(valid) if valid else float("inf")
+
+
+    def normalize_angle(self, angle):
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+
+        return angle
+
     def run(self):
         t1 = self.getTime()
 
@@ -130,10 +156,10 @@ class Mavic (Robot):
 
         # Start with short, nearby waypoints.
         waypoints = [
-            [3.0, 0.0],
-            [3.0, 3.0],
-            [0.0, 3.0],
-            [0.0, 0.5]
+            [-45, 5],
+            [-55, 5],
+            [-55, 15],
+            [-45, 15]
         ]
 
         self.target_altitude = 2.0
@@ -159,34 +185,154 @@ class Mavic (Robot):
 
             # Read LiDAR.
             ranges = self.lidar.getRangeImage()
+            scan_size = len(ranges)
 
-            valid_ranges = [
-                distance
-                for distance in ranges
-                if math.isfinite(distance)
-                and self.lidar.getMinRange()
-                <= distance
-                <= self.lidar.getMaxRange()
+            minimum_range = self.lidar.getMinRange()
+            maximum_range = self.lidar.getMaxRange()
+
+            # For a cylindrical 360-degree Webots LiDAR, the middle
+            # of the range image should face forward.
+            front_center = scan_size // 2
+            front_half_width = scan_size // 12  # 30 degrees each side
+
+            front_values = ranges[
+                front_center - front_half_width:
+                front_center + front_half_width
             ]
 
-            closest_obstacle = (
-                min(valid_ranges)
-                if valid_ranges
-                else float("inf")
+            # Approximate 90-degree sectors on either side.
+            left_values = ranges[
+                scan_size // 8:
+                3 * scan_size // 8
+            ]
+
+            right_values = ranges[
+                5 * scan_size // 8:
+                7 * scan_size // 8
+            ]
+
+            front_distance = self.minimum_valid_range(
+                front_values,
+                minimum_range,
+                maximum_range
             )
 
-            # Begin horizontal movement after takeoff.
+            left_distance = self.minimum_valid_range(
+                left_values,
+                minimum_range,
+                maximum_range
+            )
+
+            right_distance = self.minimum_valid_range(
+                right_values,
+                minimum_range,
+                maximum_range
+            )
+
+            WARNING_DISTANCE = 3.5
+            BYPASS_DISTANCE = 3.0
+
             if altitude > self.target_altitude - 1.0:
-                if self.getTime() - t1 > 0.1:
-                    yaw_disturbance, pitch_disturbance = (
-                        self.move_to_target(
-                            waypoints,
-                            verbose_movement=True,
-                            verbose_target=True
+
+                # -----------------------------------------
+                # Normal waypoint navigation
+                # -----------------------------------------
+
+                if self.avoidance_state == "NORMAL":
+                    if front_distance < WARNING_DISTANCE:
+                        pitch_disturbance = 0.0
+
+                        # Turn toward the side with more open space.
+                        if left_distance > right_distance:
+                            self.avoidance_direction = 1
+                            print("Obstacle ahead: turning left")
+                        else:
+                            self.avoidance_direction = -1
+                            print("Obstacle ahead: turning right")
+
+                        # Turn approximately 90 degrees.
+                        self.avoidance_yaw = self.normalize_angle(
+                            yaw
+                            + self.avoidance_direction
+                            * math.pi / 2.0
                         )
+
+                        self.avoidance_state = "TURN"
+
+                    elif self.getTime() - t1 > 0.1:
+                        yaw_disturbance, pitch_disturbance = (
+                            self.move_to_target(waypoints)
+                        )
+
+                        t1 = self.getTime()
+
+                # -----------------------------------------
+                # Turn away from obstacle
+                # -----------------------------------------
+
+                elif self.avoidance_state == "TURN":
+                    pitch_disturbance = 0.0
+
+                    yaw_error = self.normalize_angle(
+                        self.avoidance_yaw - yaw
                     )
 
-                    t1 = self.getTime()
+                    yaw_disturbance = clamp(
+                        0.8 * yaw_error,
+                        -self.MAX_YAW_DISTURBANCE,
+                        self.MAX_YAW_DISTURBANCE
+                    )
+
+                    if abs(yaw_error) < 0.12:
+                        self.bypass_start_position = [
+                            x_pos,
+                            y_pos
+                        ]
+
+                        self.avoidance_state = "BYPASS"
+                        print("Turn complete: beginning bypass")
+
+                # -----------------------------------------
+                # Fly alongside the obstacle
+                # -----------------------------------------
+
+                elif self.avoidance_state == "BYPASS":
+                    yaw_error = self.normalize_angle(
+                        self.avoidance_yaw - yaw
+                    )
+
+                    yaw_disturbance = clamp(
+                        0.8 * yaw_error,
+                        -self.MAX_YAW_DISTURBANCE,
+                        self.MAX_YAW_DISTURBANCE
+                    )
+
+                    # Negative pitch disturbance moves forward.
+                    pitch_disturbance = -0.5
+
+                    distance_traveled = math.hypot(
+                        x_pos - self.bypass_start_position[0],
+                        y_pos - self.bypass_start_position[1]
+                    )
+
+                    # Stop if another obstacle appears.
+                    if front_distance < 1.5:
+                        pitch_disturbance = 0.0
+
+                        self.avoidance_yaw = self.normalize_angle(
+                            yaw
+                            + self.avoidance_direction
+                            * math.pi / 2.0
+                        )
+
+                        self.avoidance_state = "TURN"
+
+                    elif distance_traveled >= BYPASS_DISTANCE:
+                        pitch_disturbance = 0.0
+                        yaw_disturbance = 0.0
+                        self.avoidance_state = "NORMAL"
+
+                        print("Bypass complete: resuming waypoint")
 
             # Flight stabilization.
             roll_input = (
